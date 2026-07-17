@@ -7,6 +7,7 @@ import './providers';
 import type { Editor, WorkspaceLeaf } from 'obsidian';
 import { MarkdownView, Notice, Plugin } from 'obsidian';
 
+import { ClaudianCompanionBridge } from './app/companion/ClaudianCompanionBridge';
 import { ConversationRepository } from './app/conversations/ConversationRepository';
 import { ClaudianProviderHost } from './app/providers/ClaudianProviderHost';
 import { DEFAULT_CLAUDIAN_SETTINGS } from './app/settings/defaultSettings';
@@ -57,6 +58,7 @@ export default class ClaudianPlugin extends Plugin {
   settings!: ClaudianSettings;
   storage!: SharedAppStorage;
   readonly providerHost = new ClaudianProviderHost(this);
+  private companionBridge: ClaudianCompanionBridge | null = null;
   private settingsCoordinator!: SettingsCoordinator<ClaudianSettings>;
   private conversationRepository!: ConversationRepository;
   private lastKnownTabManagerState: AppTabManagerState | null = null;
@@ -64,6 +66,11 @@ export default class ClaudianPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
     await ProviderWorkspaceRegistry.initializeAll(this.providerHost);
+    this.companionBridge = new ClaudianCompanionBridge({
+      providerHost: this.providerHost,
+      pluginVersion: this.manifest.version,
+    });
+    this.companionBridge.register();
 
     this.registerView(
       VIEW_TYPE_CLAUDIAN,
@@ -187,6 +194,8 @@ export default class ClaudianPlugin extends Plugin {
   }
 
   onunload(): void {
+    this.companionBridge?.dispose();
+    this.companionBridge = null;
     void this.persistOpenTabStates();
   }
 
