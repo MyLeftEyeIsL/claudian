@@ -1,25 +1,28 @@
 import { randomUUID } from 'crypto';
+import { realpathSync } from 'fs';
+import path from 'path';
 
-import type {
-  ClaudianCompanionApiV1,
-  CompanionCreateSessionRequest,
-  CompanionEvent,
-  CompanionHistoryMessage,
-  CompanionMessageRequest,
-  CompanionPermissionMode,
-  CompanionProvider,
-  CompanionProviderId,
-  CompanionResumeState,
-  CompanionSession,
-  CompanionTurnResult,
-} from '../../core/companion/CompanionApi';
 import {
   CLAUDIAN_COMPANION_API_SYMBOL,
   CLAUDIAN_COMPANION_API_VERSION,
+  type ClaudianCompanionApiV1,
+  type CompanionCreateSessionRequest,
+  type CompanionEvent,
+  type CompanionHistoryMessage,
+  type CompanionMessageRequest,
+  type CompanionPermissionMode,
+  type CompanionProvider,
+  type CompanionProviderId,
+  type CompanionResumeState,
+  type CompanionSession,
+  type CompanionToolApprovalHandler,
+  type CompanionToolApprovalRequest,
+  type CompanionTurnResult,
 } from '../../core/companion/CompanionApi';
 import type { ProviderHost } from '../../core/providers/ProviderHost';
 import { ProviderRegistry } from '../../core/providers/ProviderRegistry';
 import type { ChatRuntime } from '../../core/runtime/ChatRuntime';
+import type { ApprovalCallbackOptions } from '../../core/runtime/types';
 import type { ChatMessage, Conversation, StreamChunk } from '../../core/types';
 import { CompanionProviderHost } from './CompanionProviderHost';
 
@@ -35,6 +38,10 @@ interface ManagedSession {
   running: boolean;
   cancelRequested: boolean;
   closeRequested: boolean;
+  allowedScopes: Set<string>;
+  allowedTurnScopes: Set<string>;
+  onToolApproval?: CompanionToolApprovalHandler;
+  eventListener?: (event: CompanionEvent) => void;
 }
 
 export interface ClaudianCompanionBridgeOptions {
@@ -51,6 +58,7 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
     streaming: true,
     cancellation: true,
     vaultRootCwd: true,
+    toolApproval: true,
   } as const;
 
   private readonly sessions = new Map<string, ManagedSession>();
@@ -101,16 +109,7 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
     const runtime = this.createRuntime(host, request.providerId);
     const externalContextPaths = [...(request.externalContextPaths ?? [])];
 
-    runtime.setApprovalCallback(async (toolName) => (
-      request.permissionMode === 'auto-write' && this.isFileChangeTool(toolName)
-        ? 'allow'
-        : 'deny'
-    ));
-    runtime.setAskUserQuestionCallback(async () => null);
-    runtime.setExitPlanModeCallback(async () => null);
-    runtime.syncConversationState(conversation, externalContextPaths);
-
-    this.sessions.set(sessionId, {
+    const managedSession: ManagedSession = {
       id: sessionId,
       providerId: request.providerId,
       runtime,
@@ -120,7 +119,54 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
       running: false,
       cancelRequested: false,
       closeRequested: false,
+      allowedScopes: new Set(),
+      allowedTurnScopes: new Set(),
+    };
+    runtime.setApprovalCallback(async (toolName, input, description, options) => {
+      if (managedSession.permissionMode === 'auto-write' && this.isFileChangeTool(toolName)) {
+        return 'allow';
+      }
+      if (this.isFileChangeTool(toolName)) {
+        this.emitPolicyDenial(managedSession, `${toolName} 属于文件写入工具，不能通过只读授权放行。`);
+        return 'deny';
+      }
+      if (this.isCommandTool(toolName)) {
+        this.emitPolicyDenial(managedSession, `${toolName} 属于命令执行工具，当前策略禁止通过临时授权放行。`);
+        return 'deny';
+      }
+      const approval = this.buildApprovalRequest(
+        toolName,
+        input,
+        description,
+        options,
+        managedSession.externalContextPaths[0],
+      );
+      if (!approval) {
+        this.emitPolicyDenial(managedSession, `${toolName} 不在可交互审批的只读工具白名单中，或目标参数无效。`);
+        return 'deny';
+      }
+      if (managedSession.allowedScopes.has(approval.scope)) return 'allow';
+      if (approval.turnScope && managedSession.allowedTurnScopes.has(approval.turnScope)) return 'allow';
+      if (!managedSession.onToolApproval) return 'deny';
+      let decision;
+      try {
+        decision = await managedSession.onToolApproval(approval);
+      } catch {
+        return 'deny';
+      }
+      if (decision === 'allow-session' && approval.allowSession) {
+        managedSession.allowedScopes.add(approval.scope);
+      }
+      if (decision === 'allow-turn' && approval.allowTurn && approval.turnScope) {
+        managedSession.allowedTurnScopes.add(approval.turnScope);
+      }
+      return decision === 'deny' ? 'deny' : 'allow';
     });
+    runtime.setAskUserQuestionCallback(async () => null);
+    runtime.setExitPlanModeCallback(async () => null);
+    runtime.syncConversationState(conversation, externalContextPaths);
+
+    this.sessions.set(sessionId, managedSession);
 
     return {
       sessionId,
@@ -133,6 +179,7 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
     sessionId: string,
     request: CompanionMessageRequest,
     onEvent?: (event: CompanionEvent) => void,
+    onToolApproval?: CompanionToolApprovalHandler,
   ): Promise<CompanionTurnResult> {
     const session = this.getSession(sessionId);
     if (session.running) {
@@ -143,6 +190,9 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
     }
 
     session.running = true;
+    session.allowedTurnScopes.clear();
+    session.onToolApproval = onToolApproval;
+    session.eventListener = onEvent;
     session.cancelRequested = false;
     const turnId = randomUUID();
     const externalContextPaths = request.externalContextPaths
@@ -203,6 +253,9 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
         }
       }
       session.running = false;
+      session.allowedTurnScopes.clear();
+      session.onToolApproval = undefined;
+      session.eventListener = undefined;
       if (session.closeRequested) {
         session.runtime.cleanup();
         this.sessions.delete(session.id);
@@ -276,6 +329,171 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
 
   private isFileChangeTool(toolName: string): boolean {
     return /^(write|edit|multiedit|notebookedit|apply_patch|file_change|filechange)$/i.test(toolName);
+  }
+
+  private isCommandTool(toolName: string): boolean {
+    return /^(bash|shell|command|exec|execute|run_command|terminal)$/i.test(toolName);
+  }
+
+  private buildApprovalRequest(
+    toolName: string,
+    input: Record<string, unknown>,
+    description: string,
+    options?: ApprovalCallbackOptions,
+    workspaceRoot?: string,
+  ): CompanionToolApprovalRequest | undefined {
+    const normalized = toolName.toLowerCase();
+    const common = {
+      toolName,
+      input,
+      description,
+      riskLevel: 'low' as const,
+      ...(options?.decisionReason ? { decisionReason: options.decisionReason } : {}),
+      ...(options?.blockedPath ? { blockedPath: options.blockedPath } : {}),
+      ...(options?.networkApprovalContext ? { network: options.networkApprovalContext } : {}),
+    };
+    if (normalized === 'websearch') {
+      const query = this.stringInput(input, 'query', 'search_query', 'q');
+      return {
+        ...common,
+        category: 'network-read',
+        summary: query ? `Search: ${query}` : 'Search the web',
+        scope: 'network:websearch',
+        allowSession: true,
+        turnScope: 'network:public',
+        allowTurn: true,
+        outsideWorkspace: false,
+      };
+    }
+    if (normalized === 'webfetch') {
+      const url = this.stringInput(input, 'url', 'uri');
+      const parsedUrl = this.parseSafeUrl(url);
+      if (!url || !parsedUrl) return undefined;
+      const network = options?.networkApprovalContext ?? this.networkFromUrl(url);
+      const origin = network ? `${network.protocol}://${network.host}` : url;
+      const privateTarget = network ? this.isPrivateHost(network.host) : false;
+      return {
+        ...common,
+        ...(network ? { network } : {}),
+        category: 'network-read',
+        riskLevel: privateTarget ? 'high' : 'medium',
+        summary: url ? `Fetch: ${url}` : 'Fetch web content',
+        scope: `network:webfetch:${origin || 'unknown'}`,
+        allowSession: Boolean(origin) && !privateTarget,
+        ...(!privateTarget ? { turnScope: 'network:public' } : {}),
+        allowTurn: !privateTarget,
+        outsideWorkspace: false,
+      };
+    }
+    if (/^(read|grep|glob|search|find|list|ls)$/.test(normalized)) {
+      const target = this.stringInput(input, 'file_path', 'path', 'directory', 'cwd') ?? '.';
+      const canonicalTarget = this.canonicalPath(target, workspaceRoot);
+      const canonicalRoot = workspaceRoot ? this.canonicalPath(workspaceRoot) : undefined;
+      const scopePath = normalized === 'read'
+        ? this.pathApi(canonicalTarget).dirname(canonicalTarget)
+        : canonicalTarget;
+      const outsideWorkspace = canonicalRoot
+        ? !this.isPathWithin(canonicalTarget, canonicalRoot)
+        : false;
+      return {
+        ...common,
+        category: 'vault-read',
+        riskLevel: outsideWorkspace ? 'medium' : 'low',
+        summary: `${toolName}: ${target}`,
+        scope: `vault:${normalized}:${scopePath}`,
+        allowSession: true,
+        allowTurn: false,
+        outsideWorkspace,
+      };
+    }
+    return undefined;
+  }
+
+  private stringInput(input: Record<string, unknown>, ...keys: string[]): string | undefined {
+    for (const key of keys) {
+      const value = input[key];
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return undefined;
+  }
+
+  private networkFromUrl(value?: string): { host: string; protocol: string } | undefined {
+    const parsed = this.parseSafeUrl(value);
+    return parsed ? { host: parsed.host, protocol: parsed.protocol.replace(/:$/, '') } : undefined;
+  }
+
+  private parseSafeUrl(value?: string): URL | undefined {
+    if (!value) return undefined;
+    try {
+      const parsed = new URL(value);
+      if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) return undefined;
+      return parsed;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private isPrivateHost(value: string): boolean {
+    const lower = value.toLowerCase();
+    const hostname = lower.startsWith('[')
+      ? lower.slice(1, lower.indexOf(']') > 0 ? lower.indexOf(']') : undefined)
+      : lower.split(':')[0];
+    if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local')) return true;
+    if (hostname === '::1' || hostname.startsWith('fc') || hostname.startsWith('fd')) return true;
+    const ipv4Mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(hostname);
+    if (ipv4Mapped?.[1]) return this.isPrivateHost(ipv4Mapped[1]);
+    const ipv4MappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(hostname);
+    if (ipv4MappedHex?.[1] && ipv4MappedHex[2]) {
+      const high = Number.parseInt(ipv4MappedHex[1], 16);
+      const low = Number.parseInt(ipv4MappedHex[2], 16);
+      return this.isPrivateHost(`${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`);
+    }
+    const firstIpv6Group = /^([0-9a-f]{1,4}):/.exec(hostname)?.[1];
+    if (firstIpv6Group) {
+      const group = Number.parseInt(firstIpv6Group, 16);
+      if (group >= 0xfe80 && group <= 0xfebf) return true;
+    }
+    const octets = hostname.split('.').map(Number);
+    if (octets.length !== 4 || octets.some(value => !Number.isInteger(value) || value < 0 || value > 255)) return false;
+    return octets[0] === 10
+      || octets[0] === 127
+      || (octets[0] === 169 && octets[1] === 254)
+      || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31)
+      || (octets[0] === 192 && octets[1] === 168)
+      || octets[0] === 0;
+  }
+
+  private canonicalPath(value: string, workspaceRoot?: string): string {
+    const api = this.pathApi(value || workspaceRoot || '');
+    const absolute = api.isAbsolute(value)
+      ? api.normalize(value)
+      : api.resolve(workspaceRoot ?? '.', value);
+    try {
+      return this.normalizeComparablePath(realpathSync.native(absolute), api === path.win32);
+    } catch {
+      return this.normalizeComparablePath(absolute, api === path.win32);
+    }
+  }
+
+  private pathApi(value: string): typeof path.win32 | typeof path.posix {
+    return /^[a-z]:[\\/]/i.test(value) || value.includes('\\') ? path.win32 : path.posix;
+  }
+
+  private normalizeComparablePath(value: string, windows: boolean): string {
+    const normalized = (windows ? path.win32 : path.posix).normalize(value).replace(/[\\/]+$/, '');
+    return windows ? normalized.toLowerCase() : normalized;
+  }
+
+  private isPathWithin(target: string, root: string): boolean {
+    const api = this.pathApi(root);
+    const normalizedTarget = this.normalizeComparablePath(target, api === path.win32);
+    const normalizedRoot = this.normalizeComparablePath(root, api === path.win32);
+    const relative = api.relative(normalizedRoot, normalizedTarget);
+    return relative === '' || (!relative.startsWith('..') && !api.isAbsolute(relative));
+  }
+
+  private emitPolicyDenial(session: ManagedSession, message: string): void {
+    this.emit(session.eventListener, { type: 'notice', message, level: 'warning' });
   }
 
   private createConversation(
