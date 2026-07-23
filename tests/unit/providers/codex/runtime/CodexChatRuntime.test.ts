@@ -1415,6 +1415,27 @@ describe('CodexChatRuntime', () => {
       rt.cleanup();
     });
 
+    it('falls back to the discovered Codex default for a stale Claude-only model', async () => {
+      const plugin = createMockPlugin({ model: 'haiku' });
+      const rt = new CodexChatRuntime(plugin);
+
+      rt.syncConversationState({
+        sessionId: 'thread-resume-stale-claude-model',
+        providerState: { threadId: 'thread-resume-stale-claude-model' },
+      });
+
+      setupDefaultRequestMock('thread-resume-stale-claude-model');
+      captureHandlers();
+
+      await collectChunks(rt.query(createTurn()));
+
+      const resumeCall = findCall('thread/resume');
+      expect(resumeCall).toBeDefined();
+      expect(resumeCall[1].model).toBe(TEST_CODEX_MODEL);
+
+      rt.cleanup();
+    });
+
     it('sends serviceTier on thread/resume when fast mode is enabled', async () => {
       const plugin = createMockPlugin({ model: TEST_CODEX_MODEL, serviceTier: 'fast' });
       const rt = new CodexChatRuntime(plugin);

@@ -876,7 +876,7 @@ export class CodexChatRuntime implements ChatRuntime {
     providerSettings: Record<string, unknown> = this.getProviderSettings(),
   ): string | undefined {
     const model = queryOptions?.model ?? providerSettings.model as string | undefined;
-    if (model) {
+    if (model && !isClaudeOnlyCodexModel(model)) {
       return toCodexRuntimeModelId(model);
     }
 
@@ -1325,6 +1325,12 @@ export class CodexChatRuntime implements ChatRuntime {
       this.resolveTranscriptRootTarget(sessionFilePath),
     );
   }
+}
+
+function isClaudeOnlyCodexModel(model: string): boolean {
+  const runtimeModel = toCodexRuntimeModelId(model).trim();
+  return /^(?:haiku|sonnet|opus)$/i.test(runtimeModel)
+    || /^claude(?:[-/].*)?(?:haiku|sonnet|opus)/i.test(runtimeModel);
 }
 
 // ---------------------------------------------------------------------------
