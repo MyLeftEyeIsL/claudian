@@ -128,10 +128,14 @@ describe('ClaudianCompanionBridge', () => {
       createRuntime: () => runtime,
     });
     const session = await bridge.createSession({
-      clientId: 'vault-pilot',
+      clientId: 'mobile-helper',
       providerId: 'claude',
       permissionMode: 'read-only',
     });
+    expect(runtime.syncConversationState).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Mobile Helper remote session' }),
+      [],
+    );
 
     const result = await bridge.sendMessage(
       session.sessionId,
@@ -159,6 +163,24 @@ describe('ClaudianCompanionBridge', () => {
     expect(runtime.cleanup).toHaveBeenCalled();
   });
 
+  it('accepts companion sessions from arbitrary clients', async () => {
+    const bridge = new ClaudianCompanionBridge({
+      providerHost: createProviderHost(),
+      pluginVersion: '2.0.34',
+      createRuntime: () => createRuntime(),
+    });
+
+    await expect(bridge.createSession({
+      clientId: 'another-companion',
+      providerId: 'claude',
+      permissionMode: 'read-only',
+    })).resolves.toMatchObject({
+      providerId: 'claude',
+    });
+
+    bridge.dispose();
+  });
+
   it('isolates read-only and auto-write settings from the source host', () => {
     const source = createProviderHost();
     const claudeHost = new CompanionProviderHost(source, 'claude', 'read-only');
@@ -178,7 +200,7 @@ describe('ClaudianCompanionBridge', () => {
       createRuntime: () => runtime,
     });
     await bridge.createSession({
-      clientId: 'vault-pilot',
+      clientId: 'mobile-helper',
       providerId: 'claude',
       permissionMode: 'auto-write',
     });
@@ -197,7 +219,7 @@ describe('ClaudianCompanionBridge', () => {
       createRuntime: () => runtime,
     });
     const session = await bridge.createSession({
-      clientId: 'vault-pilot',
+      clientId: 'mobile-helper',
       providerId: 'claude',
       permissionMode: 'read-only',
       externalContextPaths: ['C:/Vault'],
@@ -255,7 +277,7 @@ describe('ClaudianCompanionBridge', () => {
       createRuntime: () => runtime,
     });
     const session = await bridge.createSession({
-      clientId: 'vault-pilot',
+      clientId: 'mobile-helper',
       providerId: 'claude',
       permissionMode: 'read-only',
     });
@@ -287,7 +309,7 @@ describe('ClaudianCompanionBridge', () => {
       createRuntime: () => runtime,
     });
     const session = await bridge.createSession({
-      clientId: 'vault-pilot',
+      clientId: 'mobile-helper',
       providerId: 'claude',
       permissionMode: 'read-only',
     });

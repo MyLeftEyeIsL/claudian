@@ -313,9 +313,6 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
   }
 
   private validateCreateRequest(request: CompanionCreateSessionRequest): void {
-    if (request.clientId !== 'vault-pilot') {
-      throw new Error('This Companion API only accepts the vault-pilot client.');
-    }
     if (!SUPPORTED_PROVIDERS.includes(request.providerId)) {
       throw new Error('Unsupported Companion provider: ' + request.providerId);
     }
@@ -507,7 +504,7 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
     return {
       id: 'companion-' + sessionId,
       providerId,
-      title: 'Vault Pilot remote session',
+      title: 'Mobile Helper remote session',
       createdAt: now,
       updatedAt: now,
       sessionId: resumeState.providerSessionId ?? null,

@@ -31,7 +31,7 @@ export interface CompanionResumeState {
 }
 
 export interface CompanionCreateSessionRequest {
-  clientId: 'vault-pilot';
+  clientId: string;
   providerId: CompanionProviderId;
   permissionMode: CompanionPermissionMode;
   selectedModel?: string;
