@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { realpathSync } from 'fs';
+import { Address4, Address6 } from 'ip-address';
 import path from 'path';
 
 import {
@@ -38,11 +39,55 @@ import { CompanionProviderHost } from './CompanionProviderHost';
 
 const SUPPORTED_PROVIDERS: readonly CompanionProviderId[] = ['claude', 'codex'];
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const prototype = Reflect.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function cloneJsonValue(
+  value: unknown,
+  label: string,
+  seen: Set<object> = new Set(),
+): unknown {
+  if (
+    value === null
+    || typeof value === 'string'
+    || typeof value === 'boolean'
+  ) {
+    return value;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'object') {
+    throw new Error(`${label} must contain only JSON-compatible values.`);
+  }
+  if (seen.has(value)) {
+    throw new Error(`${label} must contain only JSON-compatible values.`);
+  }
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return value.map(item => cloneJsonValue(item, label, seen));
+    }
+    if (!isRecord(value)) {
+      throw new Error(`${label} must contain only JSON-compatible values.`);
+    }
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, cloneJsonValue(item, label, seen)]),
+    );
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function cloneJsonRecord(value: Record<string, unknown>, label: string): Record<string, unknown> {
+  return cloneJsonValue(value, label) as Record<string, unknown>;
+}
+
 interface ManagedSession {
   readonly id: string;
   readonly providerId: CompanionProviderId;
   readonly permissionMode: CompanionPermissionMode;
-  readonly backend: ProviderExecutionBackend;
   readonly vaultRoot: string;
   interactionPort: ProviderInteractionPort;
   readonly allowedScopes: Set<string>;
@@ -85,6 +130,7 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
   } as const;
 
   private readonly sessions = new Map<string, ManagedSession>();
+  private readonly creationTasks = new Set<Promise<CompanionSession>>();
   private readonly disposalTasks = new Set<Promise<void>>();
   private readonly providerHost: ProviderHost;
   private readonly createBackend: (
@@ -123,7 +169,19 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
     }));
   }
 
-  async createSession(
+  createSession(
+    request: CompanionCreateSessionRequest,
+  ): Promise<CompanionSession> {
+    const creation = this.createSessionInternal(request);
+    this.creationTasks.add(creation);
+    void creation.then(
+      () => this.creationTasks.delete(creation),
+      () => this.creationTasks.delete(creation),
+    );
+    return creation;
+  }
+
+  private async createSessionInternal(
     request: CompanionCreateSessionRequest,
   ): Promise<CompanionSession> {
     this.assertAvailable();
@@ -138,28 +196,18 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
       request.providerId,
       'companion',
     );
+    this.assertAvailable();
 
     const sessionId = randomUUID();
     const resumeState = this.normalizeResumeState(
       request.resumeState,
       request.selectedModel,
     );
-    const companionHost = new CompanionProviderHost(
-      this.providerHost,
-      request.providerId,
-      request.permissionMode,
-    );
-    const backend = this.createBackend(companionHost, request.providerId);
-    if (backend.providerId !== request.providerId) {
-      throw new Error(`Companion backend mismatch: expected ${request.providerId}.`);
-    }
-
     const session = {} as ManagedSession;
     Object.assign(session, {
       id: sessionId,
       providerId: request.providerId,
       permissionMode: request.permissionMode,
-      backend,
       vaultRoot,
       allowedScopes: new Set<string>(),
       allowedTurnScopes: new Set<string>(),
@@ -198,12 +246,13 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
     onToolApproval?: CompanionToolApprovalHandler,
   ): Promise<CompanionTurnResult> {
     this.assertAvailable();
+    this.validateMessageRequest(request, onEvent, onToolApproval);
+    if (typeof sessionId !== 'string' || !sessionId.trim()) {
+      throw new Error('Companion sessionId must be a non-empty string.');
+    }
     const session = this.getSession(sessionId);
     if (session.running) {
       throw new Error('A turn is already running for this Companion session.');
-    }
-    if (!request.text.trim()) {
-      throw new Error('Companion message text cannot be empty.');
     }
 
     const lease = this.ensureLease(session);
@@ -249,6 +298,7 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
       this.emit(onEvent, { type: 'turn.started', turnId });
 
       for await (const event of run.events) {
+        if (session.lease !== lease || !lease.isCurrent()) continue;
         const outcome = this.handleExecutionEvent(session, event, onEvent);
         output += outcome.text;
         if (outcome.status) status = outcome.status;
@@ -273,7 +323,9 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
         this.emit(onEvent, { type: 'turn.failed', message: errorMessage });
       }
     } finally {
-      this.applyCurrentSnapshot(session, lease);
+      if (session.lease === lease && lease.isCurrent()) {
+        this.applyCurrentSnapshot(session, lease);
+      }
       this.appendHistory(session, request.text, output, startedAt);
       session.running = false;
       session.activeRun = undefined;
@@ -335,14 +387,27 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
       this.cancel(session.id);
       return this.releaseManagedSession(session);
     });
-    await Promise.allSettled([...releases, ...this.disposalTasks]);
+    await Promise.allSettled([
+      ...releases,
+      ...this.creationTasks,
+      ...this.disposalTasks,
+    ]);
     this.sessions.clear();
   }
 
   private acquireLease(session: ManagedSession): ProviderExecutionSessionLease {
+    const companionHost = new CompanionProviderHost(
+      this.providerHost,
+      session.providerId,
+      session.permissionMode,
+    );
+    const backend = this.createBackend(companionHost, session.providerId);
+    if (backend.providerId !== session.providerId) {
+      throw new Error(`Companion backend mismatch: expected ${session.providerId}.`);
+    }
     const providerSessionId = session.resumeState.providerSessionId;
     const lease = this.providerHost.executionLifecycleRegistry.acquire(
-      session.backend,
+      backend,
       {
         lifecycle: 'persistent',
         nativePersistence: 'enabled',
@@ -351,7 +416,12 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
             ? { providerSessionId }
             : {}),
           ...(session.resumeState.providerState
-            ? { providerState: { ...session.resumeState.providerState } }
+            ? {
+                providerState: cloneJsonRecord(
+                  session.resumeState.providerState,
+                  'Companion providerState',
+                ),
+              }
             : {}),
         },
         vaultWorkingDirectory: session.vaultRoot,
@@ -435,7 +505,7 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
 
     const approval = this.buildApprovalRequest(
       request.toolName,
-      { ...request.input },
+      cloneJsonRecord(request.input, 'Companion approval input'),
       request.description,
       request.decisionReason,
       request.blockedPath,
@@ -472,8 +542,10 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
     }
     if (!decision) return signal.aborted ? 'cancel' : 'deny';
     if (decision === 'deny') return 'deny';
+    if (decision === 'allow-once') return 'allow';
     if (decision === 'allow-session' && approval.allowSession) {
       session.allowedScopes.add(approval.scope);
+      return 'allow';
     }
     if (
       decision === 'allow-turn'
@@ -481,8 +553,9 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
       && approval.turnScope
     ) {
       session.allowedTurnScopes.add(approval.turnScope);
+      return 'allow';
     }
-    return 'allow';
+    return 'deny';
   }
 
   private waitForApproval(
@@ -529,7 +602,7 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
           type: 'tool.started',
           toolId: event.toolCallId,
           name: event.name,
-          input: { ...event.input },
+          input: cloneJsonRecord(event.input, 'Companion tool input'),
         });
         return { text: '' };
       case 'tool_output':
@@ -605,7 +678,12 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
       for (const key of snapshot.providerStateDeletes ?? []) {
         delete providerState[key];
       }
-      Object.assign(providerState, snapshot.providerState);
+      if (snapshot.providerState) {
+        Object.assign(
+          providerState,
+          cloneJsonRecord(snapshot.providerState, 'Companion providerState'),
+        );
+      }
       session.resumeState.providerState = Object.keys(providerState).length > 0
         ? providerState
         : undefined;
@@ -656,6 +734,12 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
   }
 
   private validateCreateRequest(request: CompanionCreateSessionRequest): void {
+    if (!isRecord(request)) {
+      throw new Error('Companion create request must be an object.');
+    }
+    if (typeof request.clientId !== 'string' || !request.clientId.trim()) {
+      throw new Error('Companion clientId must be a non-empty string.');
+    }
     if (!SUPPORTED_PROVIDERS.includes(request.providerId)) {
       throw new Error(`Unsupported Companion provider: ${request.providerId}`);
     }
@@ -668,6 +752,83 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
     if (!ProviderRegistry.isEnabled(request.providerId, this.providerHost.settings)) {
       throw new Error(`Companion provider is disabled: ${request.providerId}`);
     }
+    if (
+      request.selectedModel !== undefined
+      && (typeof request.selectedModel !== 'string' || !request.selectedModel.trim())
+    ) {
+      throw new Error('Companion selectedModel must be a non-empty string.');
+    }
+    if (request.resumeState !== undefined) {
+      if (!isRecord(request.resumeState)) {
+        throw new Error('Companion resumeState must be an object.');
+      }
+      const { providerSessionId, providerState, selectedModel } = request.resumeState;
+      if (
+        providerSessionId !== undefined
+        && providerSessionId !== null
+        && (typeof providerSessionId !== 'string' || !providerSessionId.trim())
+      ) {
+        throw new Error('Companion resumeState.providerSessionId must be a string or null.');
+      }
+      if (providerState !== undefined) {
+        if (!isRecord(providerState)) {
+          throw new Error('Companion resumeState.providerState must be an object.');
+        }
+        cloneJsonRecord(providerState, 'Companion resumeState.providerState');
+      }
+      if (
+        selectedModel !== undefined
+        && (typeof selectedModel !== 'string' || !selectedModel.trim())
+      ) {
+        throw new Error('Companion resumeState.selectedModel must be a non-empty string.');
+      }
+    }
+    if (request.history !== undefined) {
+      if (!Array.isArray(request.history)) {
+        throw new Error('Companion history must be an array.');
+      }
+      for (const message of request.history) {
+        if (
+          !isRecord(message)
+          || (message.role !== 'user' && message.role !== 'assistant')
+          || typeof message.content !== 'string'
+          || (
+            message.timestamp !== undefined
+            && (typeof message.timestamp !== 'number' || !Number.isFinite(message.timestamp))
+          )
+        ) {
+          throw new Error('Companion history contains an invalid message.');
+        }
+      }
+    }
+    this.validatePathList(request.externalContextPaths, 'Companion externalContextPaths');
+  }
+
+  private validateMessageRequest(
+    request: CompanionMessageRequest,
+    onEvent: ((event: CompanionEvent) => void) | undefined,
+    onToolApproval: CompanionToolApprovalHandler | undefined,
+  ): void {
+    if (!isRecord(request) || typeof request.text !== 'string' || !request.text.trim()) {
+      throw new Error('Companion message text must be a non-empty string.');
+    }
+    this.validatePathList(request.externalContextPaths, 'Companion externalContextPaths');
+    if (onEvent !== undefined && typeof onEvent !== 'function') {
+      throw new Error('Companion event listener must be a function.');
+    }
+    if (onToolApproval !== undefined && typeof onToolApproval !== 'function') {
+      throw new Error('Companion approval handler must be a function.');
+    }
+  }
+
+  private validatePathList(value: unknown, label: string): void {
+    if (value === undefined) return;
+    if (
+      !Array.isArray(value)
+      || value.some(pathValue => typeof pathValue !== 'string' || !pathValue.trim())
+    ) {
+      throw new Error(`${label} must contain only non-empty strings.`);
+    }
   }
 
   private normalizeResumeState(
@@ -678,7 +839,12 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
     return {
       providerSessionId: resumeState?.providerSessionId ?? null,
       ...(resumeState?.providerState
-        ? { providerState: { ...resumeState.providerState } }
+        ? {
+            providerState: cloneJsonRecord(
+              resumeState.providerState,
+              'Companion resumeState.providerState',
+            ),
+          }
         : {}),
       ...(model ? { selectedModel: model } : {}),
     };
@@ -688,7 +854,12 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
     return {
       providerSessionId: session.resumeState.providerSessionId ?? null,
       ...(session.resumeState.providerState
-        ? { providerState: { ...session.resumeState.providerState } }
+        ? {
+            providerState: cloneJsonRecord(
+              session.resumeState.providerState,
+              'Companion providerState',
+            ),
+          }
         : {}),
       ...(session.selectedModel ? { selectedModel: session.selectedModel } : {}),
     };
@@ -753,7 +924,7 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
       const network = this.networkFromUrl(url);
       if (!network) return undefined;
       const origin = `${network.protocol}://${network.host}`;
-      const privateTarget = this.isPrivateHost(network.host);
+      const privateTarget = this.isPrivateHost(parsedUrl.hostname);
       return {
         ...common,
         network,
@@ -828,10 +999,11 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
   }
 
   private isPrivateHost(value: string): boolean {
-    const lower = value.toLowerCase();
-    const hostname = lower.startsWith('[')
-      ? lower.slice(1, lower.indexOf(']') > 0 ? lower.indexOf(']') : undefined)
-      : lower.split(':')[0];
+    const lower = value.trim().toLowerCase();
+    const unwrapped = lower.startsWith('[') && lower.endsWith(']')
+      ? lower.slice(1, -1)
+      : lower;
+    const hostname = unwrapped.replace(/\.+$/, '').split('%')[0];
     if (
       hostname === 'localhost'
       || hostname.endsWith('.localhost')
@@ -839,38 +1011,38 @@ export class ClaudianCompanionBridge implements ClaudianCompanionApiV1 {
     ) {
       return true;
     }
-    if (hostname === '::1' || hostname.startsWith('fc') || hostname.startsWith('fd')) {
-      return true;
+    if (Address4.isValid(hostname)) {
+      return this.isNonPublicIpv4(new Address4(hostname));
     }
-    const ipv4Mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(hostname);
-    if (ipv4Mapped?.[1]) return this.isPrivateHost(ipv4Mapped[1]);
-    const ipv4MappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(hostname);
-    if (ipv4MappedHex?.[1] && ipv4MappedHex[2]) {
-      const high = Number.parseInt(ipv4MappedHex[1], 16);
-      const low = Number.parseInt(ipv4MappedHex[2], 16);
-      return this.isPrivateHost(
-        `${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`,
-      );
-    }
-    const firstIpv6Group = /^([0-9a-f]{1,4}):/.exec(hostname)?.[1];
-    if (firstIpv6Group) {
-      const group = Number.parseInt(firstIpv6Group, 16);
-      if (group >= 0xfe80 && group <= 0xfebf) return true;
-    }
-    const octets = hostname.split('.').map(Number);
-    if (
-      octets.length !== 4
-      || octets.some(octet =>
-        !Number.isInteger(octet) || octet < 0 || octet > 255)
-    ) {
-      return false;
-    }
-    return octets[0] === 10
-      || octets[0] === 127
-      || (octets[0] === 169 && octets[1] === 254)
-      || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31)
-      || (octets[0] === 192 && octets[1] === 168)
-      || octets[0] === 0;
+    if (!Address6.isValid(hostname)) return false;
+    const address = new Address6(hostname);
+    const embeddedIpv4 = address.embeddedIPv4();
+    if (embeddedIpv4) return this.isNonPublicIpv4(embeddedIpv4);
+    return address.isPrivate()
+      || address.isLoopback()
+      || address.isLinkLocal()
+      || address.isMulticast()
+      || address.isUnspecified()
+      || address.isCGNAT()
+      || address.isBroadcast()
+      || address.isDocumentation();
+  }
+
+  private isNonPublicIpv4(address: Address4): boolean {
+    const [first, second, third] = address.toArray();
+    return address.isPrivate()
+      || address.isLoopback()
+      || address.isLinkLocal()
+      || address.isMulticast()
+      || address.isUnspecified()
+      || address.isBroadcast()
+      || address.isCGNAT()
+      || first >= 240
+      || (first === 192 && second === 0 && third === 0)
+      || (first === 192 && second === 0 && third === 2)
+      || (first === 198 && (second === 18 || second === 19))
+      || (first === 198 && second === 51 && third === 100)
+      || (first === 203 && second === 0 && third === 113);
   }
 
   private canonicalPath(value: string, workspaceRoot?: string): string {
