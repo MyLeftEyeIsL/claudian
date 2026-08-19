@@ -560,6 +560,33 @@ describe('CodexExecutionBackend', () => {
     await session.dispose();
   });
 
+  it('fails closed instead of sending a stale Claude model to Codex', async () => {
+    const plugin = createPlugin();
+    plugin.settings.model = 'haiku';
+    plugin.settings.savedProviderModel = {};
+    const session = new CodexExecutionBackend(plugin).createSession(createSessionConfig());
+
+    const events = await collectEvents(session.execute(createRequest(
+      new AbortController().signal,
+      {
+        configuration: {
+          systemInstructions: { kind: 'provider-default' },
+          permissionMode: 'normal',
+        },
+      },
+    )).events);
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'execution_error',
+      category: 'configuration',
+      message: expect.stringContaining('No Codex model is selected'),
+    }));
+    expect(mockTransportStart).not.toHaveBeenCalled();
+    expect(mockTransportRequest).not.toHaveBeenCalled();
+
+    await session.dispose();
+  });
+
   it('recovers a completed turn when the terminal notification is missed', async () => {
     jest.useFakeTimers();
     const threadId = 'thread-missed-completion';
