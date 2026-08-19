@@ -13,6 +13,7 @@ export type ProviderExecutionOwnerKind =
   | 'title'
   | 'instruction'
   | 'inline-edit'
+  | 'companion'
   | 'warmup';
 
 export type ProviderExecutionInvalidationReason =
