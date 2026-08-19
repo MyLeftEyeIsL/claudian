@@ -10,6 +10,7 @@ StartupProfiler.finishModuleEvaluation();
 import type { Editor, TAbstractFile, WorkspaceLeaf } from 'obsidian';
 import { MarkdownView, Notice, Plugin, TFolder } from 'obsidian';
 
+import { ClaudianCompanionBridge } from './app/companion/ClaudianCompanionBridge';
 import { ConversationRepository } from './app/conversations/ConversationRepository';
 import { ClaudianProviderHost } from './app/providers/ClaudianProviderHost';
 import { ChatModelSelectionCoordinator } from './app/settings/ChatModelSelectionCoordinator';
@@ -128,6 +129,7 @@ export default class ClaudianPlugin extends Plugin {
   storage!: SharedAppStorage;
   readonly executionLifecycleRegistry = new ProviderExecutionLifecycleRegistry();
   readonly providerHost = new ClaudianProviderHost(this);
+  private companionBridge: ClaudianCompanionBridge | null = null;
   readonly warmExecutionPool = new WarmExecutionPool(
     () => this.settings?.maxWarmAgentProcesses ?? DEFAULT_MAX_WARM_AGENT_PROCESSES,
   );
@@ -306,6 +308,11 @@ export default class ClaudianPlugin extends Plugin {
       });
 
       this.addSettingTab(new ClaudianSettingTab(this.app, this));
+      this.companionBridge = new ClaudianCompanionBridge({
+        providerHost: this.providerHost,
+        pluginVersion: this.manifest.version,
+      });
+      this.companionBridge.register();
       this.scheduleRemainingSessionMetadataLoad();
     } finally {
       StartupProfiler.finishOnload();
@@ -314,6 +321,7 @@ export default class ClaudianPlugin extends Plugin {
 
   onunload(): void {
     this.isUnloading = true;
+    this.companionBridge?.unregister();
     if (this.sessionMetadataLoadTimer !== null) {
       window.clearTimeout(this.sessionMetadataLoadTimer);
       this.sessionMetadataLoadTimer = null;
@@ -327,6 +335,13 @@ export default class ClaudianPlugin extends Plugin {
     await Promise.allSettled(
       this.getAllViews().map(view => view.prepareForPluginUnload()),
     );
+    const companionBridge = this.companionBridge;
+    this.companionBridge = null;
+    try {
+      await companionBridge?.dispose();
+    } catch {
+      // Continue disposing execution resources after Companion cleanup failures.
+    }
     try {
       await this.executionLifecycleRegistry.dispose();
     } catch {

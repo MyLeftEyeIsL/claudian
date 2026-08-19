@@ -2,6 +2,10 @@
 import { Notice, TFile, TFolder } from 'obsidian';
 
 import { ConversationPersistenceStore } from '@/core/bootstrap/ConversationPersistenceStore';
+import {
+  CLAUDIAN_COMPANION_API_SYMBOL,
+  CLAUDIAN_COMPANION_API_VERSION,
+} from '@/core/companion/CompanionApi';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from '@/core/providers/ProviderSettingsCoordinator';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
@@ -181,6 +185,18 @@ describe('ClaudianPlugin', () => {
         VIEW_TYPE_CLAUDIAN,
         expect.any(Function)
       );
+    });
+
+    it('registers the Companion API after plugin initialization', async () => {
+      await plugin.onload();
+
+      expect(Reflect.get(
+        window,
+        Symbol.for(CLAUDIAN_COMPANION_API_SYMBOL),
+      )).toEqual(expect.objectContaining({
+        apiVersion: CLAUDIAN_COMPANION_API_VERSION,
+        claudianVersion: mockManifest.version,
+      }));
     });
 
     it('should add ribbon icon', async () => {
@@ -1107,9 +1123,35 @@ describe('ClaudianPlugin', () => {
       );
 
       plugin.onunload();
-      await Promise.resolve();
+      await (plugin as unknown as { applicationShutdownPromise: Promise<void> })
+        .applicationShutdownPromise;
 
       expect(disposeSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('unregisters and disposes Companion before the execution registry', async () => {
+      await plugin.onload();
+      const companionBridge = (plugin as unknown as {
+        companionBridge: { dispose(): Promise<void> };
+      }).companionBridge;
+      const disposeCompanion = jest.spyOn(companionBridge, 'dispose');
+      const disposeExecution = jest.spyOn(
+        plugin.executionLifecycleRegistry,
+        'dispose',
+      );
+
+      plugin.onunload();
+
+      expect(Reflect.get(
+        window,
+        Symbol.for(CLAUDIAN_COMPANION_API_SYMBOL),
+      )).toBeUndefined();
+      await (plugin as unknown as { applicationShutdownPromise: Promise<void> })
+        .applicationShutdownPromise;
+      expect(disposeCompanion).toHaveBeenCalledTimes(1);
+      expect(disposeCompanion.mock.invocationCallOrder[0]).toBeLessThan(
+        disposeExecution.mock.invocationCallOrder[0],
+      );
     });
 
     it('drains views before disposing execution and workspace resources', async () => {
