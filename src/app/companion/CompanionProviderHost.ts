@@ -15,6 +15,10 @@ function buildCompanionSettings(
     source,
     providerId,
   );
+  // Provider execution sessions read provider projection maps before the
+  // top-level projection. Keep this isolated snapshot coherent so a stale
+  // inactive-provider model cannot shadow the valid projected fallback.
+  ProviderSettingsCoordinator.persistProjectedProviderState(settings, providerId);
   const permissionMode = companionMode === 'read-only' && providerId === 'claude'
     ? 'plan'
     : 'normal';
